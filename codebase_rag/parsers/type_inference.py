@@ -47,6 +47,56 @@ class TypeInferenceEngine:
         self._java_type_inference: JavaTypeInferenceEngine | None = None
         self._lua_type_inference: LuaTypeInferenceEngine | None = None
         self._js_type_inference: JsTypeInferenceEngine | None = None
+        
+        # Recursion tracking to prevent infinite loops
+        self._recursion_depth = 0
+        self._max_recursion_depth = 50
+        self._analyzing_attributes = set()  # Track currently analyzing attributes
+        
+        # Skip patterns that commonly cause recursion issues
+        self._skip_patterns = {
+            "global_config",
+            "addon_params", 
+            "config",
+            "__dict__",
+            "__class__",
+            "__module__",
+            "__globals__"
+        }
+
+    def _should_skip_analysis(self, name: str) -> bool:
+        """Check if we should skip analysis for this name to prevent recursion."""
+        if self._recursion_depth >= self._max_recursion_depth:
+            logger.debug(f"Skipping {name} - max recursion depth reached")
+            return True
+            
+        if name in self._analyzing_attributes:
+            logger.debug(f"Skipping {name} - circular reference detected")
+            return True
+            
+        if any(pattern in name.lower() for pattern in self._skip_patterns):
+            logger.debug(f"Skipping {name} - matches skip pattern")
+            return True
+            
+        return False
+
+    def _with_recursion_tracking(self, name: str):
+        """Context manager for recursion tracking."""
+        class RecursionTracker:
+            def __init__(self, engine, attr_name):
+                self.engine = engine
+                self.attr_name = attr_name
+                
+            def __enter__(self):
+                self.engine._recursion_depth += 1
+                self.engine._analyzing_attributes.add(self.attr_name)
+                return self
+                
+            def __exit__(self, exc_type, exc_val, exc_tb):
+                self.engine._recursion_depth -= 1
+                self.engine._analyzing_attributes.discard(self.attr_name)
+                
+        return RecursionTracker(self, name)
 
     @property
     def java_type_inference(self) -> JavaTypeInferenceEngine:
@@ -464,6 +514,11 @@ class TypeInferenceEngine:
                     left_text = left_node.text
                     if left_text and left_text.decode("utf8").startswith("self."):
                         attr_name = left_text.decode("utf8")
+                        
+                        # Skip problematic attributes that cause recursion
+                        if self._should_skip_analysis(attr_name):
+                            continue
+                            
                         assigned_type = self._infer_type_from_expression(
                             right_node, module_qn
                         )
@@ -862,21 +917,26 @@ class TypeInferenceEngine:
         """
         Infer the return type of a method call by analyzing the method's implementation.
         """
+        # Check if we should skip this analysis to prevent recursion
+        if self._should_skip_analysis(method_call):
+            return None
+            
         try:
-            # Parse the method call to get the method qualified name
-            method_qn = self._resolve_method_qualified_name(
-                method_call, module_qn, local_var_types
-            )
-            if not method_qn:
-                return None
+            with self._with_recursion_tracking(method_call):
+                # Parse the method call to get the method qualified name
+                method_qn = self._resolve_method_qualified_name(
+                    method_call, module_qn, local_var_types
+                )
+                if not method_qn:
+                    return None
 
-            # Find the method's AST node from our cache
-            method_node = self._find_method_ast_node(method_qn)
-            if not method_node:
-                return None
+                # Find the method's AST node from our cache
+                method_node = self._find_method_ast_node(method_qn)
+                if not method_node:
+                    return None
 
-            # Analyze return statements in the method
-            return self._analyze_method_return_statements(method_node, method_qn)
+                # Analyze return statements in the method
+                return self._analyze_method_return_statements(method_node, method_qn)
 
         except Exception as e:
             logger.debug(f"Failed to infer return type for {method_call}: {e}")
@@ -987,39 +1047,44 @@ class TypeInferenceEngine:
 
     def _infer_attribute_type(self, attribute_name: str, module_qn: str) -> str | None:
         """Infer the type of an instance attribute like self.manager."""
+        # Check if we should skip this analysis to prevent recursion
+        if self._should_skip_analysis(attribute_name):
+            return None
+            
         # Extract the class name from the module_qn
         # module_qn looks like "project.services.user_service" and we need the class context
         # This is challenging because we don't know which class we're currently analyzing
         # Let's try to find it by analyzing the available AST nodes
 
         try:
-            # Look for the class definition that might contain this method call
-            for file_path, (root_node, language) in self.ast_cache.items():
-                if language != "python":
-                    continue
+            with self._with_recursion_tracking(attribute_name):
+                # Look for the class definition that might contain this method call
+                for file_path, (root_node, language) in self.ast_cache.items():
+                    if language != "python":
+                        continue
 
-                # Check if this file matches our module
-                relative_path = file_path.relative_to(self.repo_path)
-                file_module_qn = ".".join(
-                    [self.project_name] + list(relative_path.with_suffix("").parts)
-                )
-                if file_path.name == "__init__.py":
+                    # Check if this file matches our module
+                    relative_path = file_path.relative_to(self.repo_path)
                     file_module_qn = ".".join(
-                        [self.project_name] + list(relative_path.parent.parts)
+                        [self.project_name] + list(relative_path.with_suffix("").parts)
                     )
+                    if file_path.name == "__init__.py":
+                        file_module_qn = ".".join(
+                            [self.project_name] + list(relative_path.parent.parts)
+                        )
 
-                if file_module_qn != module_qn:
-                    continue
+                    if file_module_qn != module_qn:
+                        continue
 
-                # Look for all classes in this module and analyze their instance variables
-                instance_vars: dict[str, str] = {}
-                self._analyze_self_assignments(root_node, instance_vars, module_qn)
+                    # Look for all classes in this module and analyze their instance variables
+                    instance_vars: dict[str, str] = {}
+                    self._analyze_self_assignments(root_node, instance_vars, module_qn)
 
-                # Check if our attribute was found
-                full_attr_name = f"self.{attribute_name}"
-                if full_attr_name in instance_vars:
-                    attr_type: str = instance_vars[full_attr_name]
-                    return attr_type
+                    # Check if our attribute was found
+                    full_attr_name = f"self.{attribute_name}"
+                    if full_attr_name in instance_vars:
+                        attr_type: str = instance_vars[full_attr_name]
+                        return attr_type
 
         except Exception as e:
             logger.debug(
